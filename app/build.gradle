@@ -16,7 +16,7 @@ android {
         minSdk rootProject.ext.minSdk
         targetSdk rootProject.ext.targetSdk
         versionCode 15
-        versionName "1.1.0"
+        versionName "1.1.2"
         multiDexEnabled true
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
@@ -41,10 +41,10 @@ android {
     }
     signingConfigs {
         release {
-            storeFile file('../wongsyrone.jks')
-            storePassword 'wongsyrone'
-            keyAlias 'wongsyrone'
-            keyPassword 'wongsyrone'
+            storeFile file('../refactor.jks')
+            storePassword 'refactor'
+            keyAlias 'refactor'
+            keyPassword 'refactor'
 
             v1SigningEnabled true
             v2SigningEnabled true
