@@ -17,29 +17,6 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
-      # - name: ⚙️ Force Manual Submodule Update (Ensures file availability)
-      #   # 这一步是关键，明确执行 git submodule update 以防 checkout 步骤遗漏
-      #   run: git submodule update --init --recursive
-
-      - name: 🔎 Verify Critical Submodule File (lz4.c)
-        # 验证 CMake 需要的 lz4.c 文件是否在正确的位置
-        run: |
-          set -ex
-          TARGET_FILE="externals/core/ext/lz4/lz4.c"
-          
-          echo "--- Listing contents of: externals/core/ext/ ---"
-          # 列出目标目录的内容以进行可视化检查
-          ls -F externals/core/ext/lz4/ || echo "Directory 'externals/core/ext/lz4' not found."
-
-          echo "--- Checking for existence of ${TARGET_FILE} ---"
-          if [ -f "$TARGET_FILE" ]; then
-            echo "✅ SUCCESS: The required C source file was found at ${TARGET_FILE}."
-          else
-            echo "❌ FAILURE: The required C source file IS MISSING. CMake will fail."
-            # 如果文件确实缺失，可以在这里添加 'exit 1' 来提前中断构建
-            exit 1 
-          fi
-
       - name: Set up JDK 17
         uses: actions/setup-java@v3
         with:
@@ -56,10 +33,6 @@ jobs:
           cmdline-tools-version: 'latest'
           log-accepted-android-sdk-licenses: 'false'
           packages: 'tools platform-tools cmake;3.31.5 platforms;android-35 ndk;28.0.13004108'
-
-      - name: 🧹 Clean Gradle/CMake Cache
-        # 清理之前的缓存和配置，确保 CMake 重新运行配置步骤
-        run: ./gradlew clean
 
       - name: Build APK
         run: ./gradlew :app:assembleRelease
