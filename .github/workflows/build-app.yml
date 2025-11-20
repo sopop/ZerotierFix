@@ -37,7 +37,7 @@ jobs:
           else
             echo "❌ FAILURE: The required C source file IS MISSING. CMake will fail."
             # 如果文件确实缺失，可以在这里添加 'exit 1' 来提前中断构建
-            # exit 1 
+            exit 1 
           fi
 
       - name: Set up JDK 17
@@ -60,7 +60,7 @@ jobs:
       - name: 🧹 Clean Gradle/CMake Cache
         # 清理之前的缓存和配置，确保 CMake 重新运行配置步骤
         run: ./gradlew clean
-        
+
       - name: Build APK
         run: ./gradlew :app:assembleRelease
 
