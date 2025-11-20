@@ -17,9 +17,9 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
-      - name: ⚙️ Force Manual Submodule Update (Ensures file availability)
-        # 这一步是关键，明确执行 git submodule update 以防 checkout 步骤遗漏
-        run: git submodule update --init --recursive
+      # - name: ⚙️ Force Manual Submodule Update (Ensures file availability)
+      #   # 这一步是关键，明确执行 git submodule update 以防 checkout 步骤遗漏
+      #   run: git submodule update --init --recursive
 
       - name: 🔎 Verify Critical Submodule File (lz4.c)
         # 验证 CMake 需要的 lz4.c 文件是否在正确的位置
