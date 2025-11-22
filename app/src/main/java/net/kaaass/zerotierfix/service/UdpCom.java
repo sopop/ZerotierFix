@@ -31,18 +31,15 @@ public class UdpCom implements PacketSender, Runnable {
         this.node = node2;
     }
 
-    // 修复: 调整方法签名以匹配新的 PacketSender 接口 (ByteBuffer -> byte[])
     @Override // com.zerotier.sdk.PacketSender
-    public int onSendPacketRequested(long j, InetSocketAddress inetSocketAddress, byte[] bArr, int i) { // **修改: ByteBuffer -> byte[]**
+    public int onSendPacketRequested(long j, InetSocketAddress inetSocketAddress, ByteBuffer bArr, int i) {
         if (this.svrChannel == null) {
-            Log.e(TAG, "Attempted to send packet on a null channel: " + inetSocketAddress.toString());
+            Log.e(TAG, "Attempted to send packet on a null socket");
             return -1;
         }
         try {
-            // 修复: 将 byte[] 包装为 ByteBuffer 以发送
-            ByteBuffer buf = ByteBuffer.wrap(bArr);
-            DebugLog.d(TAG, "onSendPacketRequested: Sent " + buf.remaining() + " bytes to " + inetSocketAddress.toString());
-            this.svrChannel.send(buf, inetSocketAddress); // 发送 ByteBuffer
+            DebugLog.d(TAG, "onSendPacketRequested: Sent " + bArr.remaining() + " bytes to " + inetSocketAddress.toString());
+            this.svrChannel.send(bArr, inetSocketAddress);
             return 0;
         } catch (Exception unused) {
             return -1;
@@ -61,12 +58,7 @@ public class UdpCom implements PacketSender, Runnable {
                     buf.flip();
                     if (buf.remaining() > 0) {
                         DebugLog.d(TAG, "Got " + buf.remaining() + " Bytes From: " + recvSockAddr);
-                        
-                        // 修复: 将 ByteBuffer 转换为 byte[] 以便调用 processWirePacket
-                        var dataArray = new byte[buf.remaining()];
-                        buf.get(dataArray);
-
-                        ResultCode processWirePacket = this.node.processWirePacket(System.currentTimeMillis(), -1, (InetSocketAddress) recvSockAddr, dataArray, jArr); // 使用 byte[]
+                        ResultCode processWirePacket = this.node.processWirePacket(System.currentTimeMillis(), -1, (InetSocketAddress) recvSockAddr, buf, jArr);
                         if (processWirePacket != ResultCode.RESULT_OK) {
                             Log.e(TAG, "processWirePacket returned: " + processWirePacket.toString());
                             this.ztService.shutdown();

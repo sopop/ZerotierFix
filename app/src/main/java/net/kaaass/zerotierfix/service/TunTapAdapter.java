@@ -33,321 +33,489 @@ public class TunTapAdapter implements VirtualNetworkFrameListener {
     private static final int ARP_PACKET = 2054;
     private static final int IPV4_PACKET = 2048;
     private static final int IPV6_PACKET = 34525;
-    private final Node node;
+    private final HashMap<Route, Long> routeMap = new HashMap<>();
     private final long networkId;
-    private final FileChannel vpnOutFileChannel;
     private final ZeroTierOneService ztService;
-    private final TunTapARPTable arpTable;
-    private final HashMap<Route, Long> routeMap;
+    private ARPTable arpTable = new ARPTable();
+    private FileChannel vpnInFileChannel;
+    private NDPTable ndpTable = new NDPTable();
+    private Node node;
+    private FileChannel vpnOutFileChannel;
+    private Thread receiveThread;
+    private ParcelFileDescriptor vpnSocket;
 
-    TunTapAdapter(ZeroTierOneService zeroTierOneService, long j, ParcelFileDescriptor parcelFileDescriptor) {
-        this.networkId = j;
+    public TunTapAdapter(ZeroTierOneService zeroTierOneService, long j) {
         this.ztService = zeroTierOneService;
-        this.node = zeroTierOneService.getNode();
-        this.vpnOutFileChannel = parcelFileDescriptor.getFileDescriptor() == null ? null : new java.io.FileOutputStream(parcelFileDescriptor.getFileDescriptor()).getChannel();
-        this.arpTable = new TunTapARPTable(this.node, j);
-        this.routeMap = new HashMap<>();
+        this.networkId = j;
     }
 
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void addRoute(Route route) {
-        synchronized (this.routeMap) {
-            this.routeMap.put(route, this.networkId);
+    public static long multicastAddressToMAC(InetAddress inetAddress) {
+        if (inetAddress instanceof Inet4Address) {
+            byte[] address = inetAddress.getAddress();
+            return ByteBuffer.wrap(new byte[]{0, 0, 1, 0, 94, (byte) (address[1] & Byte.MAX_VALUE), address[2], address[3]}).getLong();
+        } else if (!(inetAddress instanceof Inet6Address)) {
+            return 0;
+        } else {
+            byte[] address2 = inetAddress.getAddress();
+            return ByteBuffer.wrap(new byte[]{0, 0, 51, 51, address2[12], address2[13], address2[14], address2[15]}).getLong();
         }
     }
 
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void removeRoute(Route route) {
-        synchronized (this.routeMap) {
-            this.routeMap.remove(route);
+    private void addMulticastRoutes() {
+    }
+
+    public void setNode(Node node) {
+        this.node = node;
+        try {
+            var multicastAddress = InetAddress.getByName("224.224.224.224");
+            var result = node
+                    .multicastSubscribe(this.networkId, multicastAddressToMAC(multicastAddress));
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error when calling multicastSubscribe: " + result);
+            }
+        } catch (UnknownHostException e) {
+            Log.e(TAG, e.toString(), e);
         }
     }
 
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void clearRoutes() {
+    public void setVpnSocket(ParcelFileDescriptor vpnSocket) {
+        this.vpnSocket = vpnSocket;
+    }
+
+    public void setFileChannels(FileChannel in, FileChannel out) {
+        this.vpnInFileChannel = in;
+        this.vpnOutFileChannel = out;
+    }
+
+    public void addRouteAndNetwork(Route route, long networkId) {
+        synchronized (this.routeMap) {
+            this.routeMap.put(route, networkId);
+        }
+    }
+
+    public void clearRouteMap() {
         synchronized (this.routeMap) {
             this.routeMap.clear();
+            addMulticastRoutes();
         }
     }
 
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void close() {
-        try {
-            if (this.vpnOutFileChannel != null) {
-                this.vpnOutFileChannel.close();
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "Error closing vpnOutFileChannel: " + e.getMessage(), e);
-        }
+    private boolean isIPv4Multicast(InetAddress inetAddress) {
+        return (inetAddress.getAddress()[0] & 0xF0) == 224;
     }
 
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void onVirtualNetworkConfigChanged(VirtualNetworkConfig virtualNetworkConfig) {
-        this.arpTable.onVirtualNetworkConfigChanged(virtualNetworkConfig);
+    private boolean isIPv6Multicast(InetAddress inetAddress) {
+        return (inetAddress.getAddress()[0] & 0xFF) == 0xFF;
     }
 
-    private void handleIPv4Packet(long localMac, long nextDeadline, ByteBuffer byteBuffer,
-                                  InetAddress destAddress) throws UnknownHostException {
-        if (!this.node.hasRoute(this.networkId, destAddress.getAddress(), 24)) {
-            // Check for ARP or Route
-            var route = routeForDestination(destAddress);
-            if (route == null) {
-                Log.e(TAG, "No route found for destination: " + destAddress);
-                return;
-            }
-            if (route.isARPNeeded()) {
-                var destMac = this.arpTable.lookup(destAddress);
-                if (destMac == 0) {
-                    var arpReqPacket = this.arpTable.buildARPRequest(destAddress, localMac);
-                    if (arpReqPacket == null) {
-                        Log.e(TAG, "Error building ARP request packet for " + destAddress);
-                        return;
-                    }
+    public void startThreads() {
+        this.receiveThread = new Thread("Tunnel Receive Thread") {
 
-                    // 修复: 将 ByteBuffer 转换为 byte[]
-                    var arpDataArray = new byte[arpReqPacket.remaining()];
-                    arpReqPacket.get(arpDataArray);
-
-                    var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, ARP_PACKET, 0, arpDataArray, nextDeadline); // 使用 byte[]
-                    if (result != ResultCode.RESULT_OK) {
-                        Log.e(TAG, "processVirtualNetworkFrame for ARP returned: " + result.toString());
-                        this.ztService.shutdown();
-                    }
-                    this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-                    return;
+            @Override
+            public void run() {
+                // 创建 ARP、NDP 表
+                if (TunTapAdapter.this.ndpTable == null) {
+                    TunTapAdapter.this.ndpTable = new NDPTable();
                 }
-
-                // 修复: 将 ByteBuffer 转换为 byte[]
-                var dataArray = new byte[byteBuffer.remaining()];
-                byteBuffer.get(dataArray);
-
-                // 重新设置byteBuffer，以便在发送后不影响原始逻辑
-                byteBuffer.rewind();
-
-                var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV4_PACKET, 0, dataArray, nextDeadline); // 使用 byte[]
-                if (result != ResultCode.RESULT_OK) {
-                    Log.e(TAG, "processVirtualNetworkFrame returned: " + result.toString());
-                    this.ztService.shutdown();
+                if (TunTapAdapter.this.arpTable == null) {
+                    TunTapAdapter.this.arpTable = new ARPTable();
                 }
-                this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-            }
-        } else {
-            // Direct Route
-            long destMac = this.node.lookupMac(this.networkId, destAddress.getAddress(), 24);
-
-            // 修复: 将 ByteBuffer 转换为 byte[]
-            var dataArray = new byte[byteBuffer.remaining()];
-            byteBuffer.get(dataArray);
-
-            // 重新设置byteBuffer，以便在发送后不影响原始逻辑
-            byteBuffer.rewind();
-
-            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV4_PACKET, 0, dataArray, nextDeadline); // 使用 byte[]
-            if (result != ResultCode.RESULT_OK) {
-                Log.e(TAG, "processVirtualNetworkFrame returned: " + result.toString());
-                this.ztService.shutdown();
-            }
-            this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-        }
-    }
-
-    private void handleIPv6Packet(long localMac, long nextDeadline, ByteBuffer byteBuffer,
-                                  InetAddress destAddress) throws UnknownHostException {
-        if (!this.node.hasRoute(this.networkId, destAddress.getAddress(), 120)) {
-            // Check for Route
-            var route = routeForDestination(destAddress);
-            if (route == null) {
-                Log.e(TAG, "No route found for destination: " + destAddress);
-                return;
-            }
-
-            // 修复: 将 ByteBuffer 转换为 byte[]
-            var dataArray = new byte[byteBuffer.remaining()];
-            byteBuffer.get(dataArray);
-
-            // 重新设置byteBuffer，以便在发送后不影响原始逻辑
-            byteBuffer.rewind();
-
-            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, 0, IPV6_PACKET, 0, dataArray, nextDeadline); // 使用 byte[]
-            if (result != ResultCode.RESULT_OK) {
-                Log.e(TAG, "processVirtualNetworkFrame returned: " + result.toString());
-                this.ztService.shutdown();
-            }
-            this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-        } else {
-            // Direct Route
-            long destMac = this.node.lookupMac(this.networkId, destAddress.getAddress(), 120);
-
-            // 修复: 将 ByteBuffer 转换为 byte[]
-            var dataArray = new byte[byteBuffer.remaining()];
-            byteBuffer.get(dataArray);
-
-            // 重新设置byteBuffer，以便在发送后不影响原始逻辑
-            byteBuffer.rewind();
-
-            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV6_PACKET, 0, dataArray, nextDeadline); // 使用 byte[]
-            if (result != ResultCode.RESULT_OK) {
-                Log.e(TAG, "processVirtualNetworkFrame returned: " + result.toString());
-                this.ztService.shutdown();
-            }
-            this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-        }
-    }
-
-    /* JADX INFO: Access modifiers changed from: package-private */
-    public void handleVirtualNetworkFrame(long localMac, long nextDeadline, ByteBuffer byteBuffer) {
-        if (byteBuffer.remaining() >= 14) {
-            int etherType = byteBuffer.getChar(12) & 65535;
-            InetAddress destAddress;
-
-            try {
-                switch (etherType) {
-                    case IPV4_PACKET:
-                        destAddress = InetAddressUtils.getDestIPv4(byteBuffer);
-                        handleIPv4Packet(localMac, nextDeadline, byteBuffer, destAddress);
-                        break;
-                    case IPV6_PACKET:
-                        destAddress = InetAddressUtils.getDestIPv6(byteBuffer);
-                        handleIPv6Packet(localMac, nextDeadline, byteBuffer, destAddress);
-                        break;
-                    case ARP_PACKET:
-                        // ARP does not require address lookup, it is handled internally
-                        // 修复: 将 ByteBuffer 转换为 byte[]
-                        var arpDataArray = new byte[byteBuffer.remaining()];
-                        byteBuffer.get(arpDataArray);
-
-                        // 重新设置byteBuffer，以便在发送后不影响原始逻辑
-                        byteBuffer.rewind();
-
-                        var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, 0, ARP_PACKET, 0, arpDataArray, nextDeadline); // 使用 byte[]
-                        if (result != ResultCode.RESULT_OK) {
-                            Log.e(TAG, "processVirtualNetworkFrame for ARP returned: " + result.toString());
-                            this.ztService.shutdown();
+                // 转发 TUN 消息至 Zerotier
+                try {
+                    Log.d(TunTapAdapter.TAG, "TUN Receive Thread Started");
+                    var buffer = ByteBuffer.allocateDirect(32767);
+                    buffer.order(ByteOrder.LITTLE_ENDIAN);
+                    while (TunTapAdapter.this.vpnInFileChannel.isOpen()) {
+                        try {
+                            int readCount = TunTapAdapter.this.vpnInFileChannel.read(buffer);
+                            if (readCount > 0) {
+                                DebugLog.d(TunTapAdapter.TAG, "Sending packet to ZeroTier. " + readCount + " bytes.");
+                                buffer.flip();
+                                byte iPVersion = IPPacketUtils.getIPVersion(buffer);
+                                if (iPVersion == 4) {
+                                    TunTapAdapter.this.handleIPv4Packet(buffer);
+                                } else if (iPVersion == 6) {
+                                    TunTapAdapter.this.handleIPv6Packet(buffer);
+                                } else {
+                                    Log.e(TunTapAdapter.TAG, "Unknown IP version");
+                                }
+                                buffer.clear();
+                            } else if (readCount == -1) {
+                                break;
+                            } else {
+                                //Thread.sleep(10);
+                            }
+                        } catch (IOException e) {
+                            Log.e(TunTapAdapter.TAG, "Error in TUN Receive: " + e.getMessage(), e);
                         }
-                        this.ztService.setNextBackgroundTaskDeadline(nextDeadline);
-                        break;
-                    default:
-                        Log.d(TAG, "Unknown Packet Type Received: 0x" + String.format("%04X", etherType));
-                        break;
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "Error handling packet: " + e.getMessage(), e);
+                Log.d(TunTapAdapter.TAG, "TUN Receive Thread ended");
+                // 关闭 ARP、NDP 表
+                TunTapAdapter.this.ndpTable.stop();
+                TunTapAdapter.this.ndpTable = null;
+                TunTapAdapter.this.arpTable.stop();
+                TunTapAdapter.this.arpTable = null;
+            }
+        };
+        this.receiveThread.start();
+    }
+
+    private void handleIPv4Packet(ByteBuffer byteBuffer) {
+        boolean isMulticast;
+        long destMac;
+        var destIP = IPPacketUtils.getDestIP(byteBuffer);
+        var sourceIP = IPPacketUtils.getSourceIP(byteBuffer);
+        var virtualNetworkConfig = this.ztService.getVirtualNetworkConfig(this.networkId);
+
+        if (virtualNetworkConfig == null) {
+            Log.e(TAG, "TunTapAdapter has no network config yet");
+            return;
+        } else if (destIP == null) {
+            Log.e(TAG, "destAddress is null");
+            return;
+        } else if (sourceIP == null) {
+            Log.e(TAG, "sourceAddress is null");
+            return;
+        }
+        if (isIPv4Multicast(destIP)) {
+            var result = this.node.multicastSubscribe(this.networkId, multicastAddressToMAC(destIP));
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error when calling multicastSubscribe: " + result);
+            }
+            isMulticast = true;
+        } else {
+            isMulticast = false;
+        }
+        var route = routeForDestination(destIP);
+        var gateway = route != null ? route.getGateway() : null;
+
+        // 查找当前节点的 v4 地址
+        var ztAddresses = virtualNetworkConfig.getAssignedAddresses();
+        InetAddress localV4Address = null;
+        int cidr = 0;
+
+        for (var address : ztAddresses) {
+            if (address.getAddress() instanceof Inet4Address) {
+                localV4Address = address.getAddress();
+                cidr = address.getPort();
+                break;
+            }
+        }
+
+        var destRoute = InetAddressUtils.addressToRouteNo0Route(destIP, cidr);
+        var sourceRoute = InetAddressUtils.addressToRouteNo0Route(sourceIP, cidr);
+        if (gateway != null && !Objects.equals(destRoute, sourceRoute)) {
+            destIP = gateway;
+        }
+        if (localV4Address == null) {
+            Log.e(TAG, "Couldn't determine local address");
+            return;
+        }
+
+        long localMac = virtualNetworkConfig.getMac();
+        long[] nextDeadline = new long[1];
+        if (isMulticast || this.arpTable.hasMacForAddress(destIP)) {
+            // 已确定目标 MAC，直接发送
+            if (isIPv4Multicast(destIP)) {
+                destMac = multicastAddressToMAC(destIP);
+            } else {
+                destMac = this.arpTable.getMacForAddress(destIP);
+            }
+            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV4_PACKET, 0, byteBuffer, nextDeadline);
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error calling processVirtualNetworkFrame: " + result.toString());
+                return;
+            }
+            Log.d(TAG, "Packet sent to ZT");
+            this.ztService.setNextBackgroundTaskDeadline(nextDeadline[0]);
+        } else {
+            // 目标 MAC 未知，进行 ARP 查询
+            Log.d(TAG, "Unknown dest MAC address.  Need to look it up. " + destIP);
+            destMac = InetAddressUtils.BROADCAST_MAC_ADDRESS;
+            ByteBuffer arpReqPacket = this.arpTable.getRequestPacket(localMac, localV4Address, destIP);
+            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, ARP_PACKET, 0, arpReqPacket, nextDeadline);
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error sending ARP packet: " + result.toString());
+                return;
+            }
+            Log.d(TAG, "ARP Request Sent!");
+            this.ztService.setNextBackgroundTaskDeadline(nextDeadline[0]);
+        }
+    }
+
+    private void handleIPv6Packet(ByteBuffer byteBuffer) {
+        var destIP = IPPacketUtils.getDestIP(byteBuffer);
+        var sourceIP = IPPacketUtils.getSourceIP(byteBuffer);
+        var virtualNetworkConfig = this.ztService.getVirtualNetworkConfig(this.networkId);
+
+        if (virtualNetworkConfig == null) {
+            Log.e(TAG, "TunTapAdapter has no network config yet");
+            return;
+        } else if (destIP == null) {
+            Log.e(TAG, "destAddress is null");
+            return;
+        } else if (sourceIP == null) {
+            Log.e(TAG, "sourceAddress is null");
+            return;
+        }
+        if (this.isIPv6Multicast(destIP)) {
+            var result = this.node.multicastSubscribe(this.networkId, multicastAddressToMAC(destIP));
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error when calling multicastSubscribe: " + result);
+            }
+        }
+        var route = routeForDestination(destIP);
+        var gateway = route != null ? route.getGateway() : null;
+
+        // 查找当前节点的 v6 地址
+        var ztAddresses = virtualNetworkConfig.getAssignedAddresses();
+        InetAddress localV4Address = null;
+        int cidr = 0;
+
+        for (var address : ztAddresses) {
+            if (address.getAddress() instanceof Inet6Address) {
+                localV4Address = address.getAddress();
+                cidr = address.getPort();
+                break;
+            }
+        }
+
+        var destRoute = InetAddressUtils.addressToRouteNo0Route(destIP, cidr);
+        var sourceRoute = InetAddressUtils.addressToRouteNo0Route(sourceIP, cidr);
+        if (gateway != null && !Objects.equals(destRoute, sourceRoute)) {
+            destIP = gateway;
+        }
+        if (localV4Address == null) {
+            Log.e(TAG, "Couldn't determine local address");
+            return;
+        }
+
+        long localMac = virtualNetworkConfig.getMac();
+        long[] nextDeadline = new long[1];
+
+        // 确定目标 MAC 地址
+        long destMac;
+        boolean sendNSPacket = false;
+        if (this.isNeighborSolicitation(byteBuffer)) {
+            // 收到本地 NS 报文，根据 NDP 表记录确定是否广播查询
+            if (this.ndpTable.hasMacForAddress(destIP)) {
+                destMac = this.ndpTable.getMacForAddress(destIP);
+            } else {
+                destMac = InetAddressUtils.ipv6ToMulticastAddress(destIP);
+            }
+        } else if (this.isIPv6Multicast(destIP)) {
+            // 多播报文
+            destMac = multicastAddressToMAC(destIP);
+        } else if (this.isNeighborAdvertisement(byteBuffer)) {
+            // 收到本地 NA 报文
+            if (this.ndpTable.hasMacForAddress(destIP)) {
+                destMac = this.ndpTable.getMacForAddress(destIP);
+            } else {
+                // 目标 MAC 未知，不发送数据包
+                destMac = 0L;
+            }
+            sendNSPacket = true;
+        } else {
+            // 收到普通数据包，根据 NDP 表记录确定是否发送 NS 请求
+            if (this.ndpTable.hasMacForAddress(destIP)) {
+                // 目标地址 MAC 已知
+                destMac = this.ndpTable.getMacForAddress(destIP);
+            } else {
+                destMac = 0L;
+                sendNSPacket = true;
+            }
+        }
+        // 发送数据包
+        if (destMac != 0L) {
+            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV6_PACKET, 0, byteBuffer, nextDeadline);
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error calling processVirtualNetworkFrame: " + result.toString());
+            } else {
+                DebugLog.d(TAG, "Packet sent to ZT");
+                this.ztService.setNextBackgroundTaskDeadline(nextDeadline[0]);
+            }
+        }
+        // 发送 NS 请求
+        if (sendNSPacket) {
+            if (destMac == 0L) {
+                destMac = InetAddressUtils.ipv6ToMulticastAddress(destIP);
+            }
+            Log.d(TAG, "Sending Neighbor Solicitation");
+            ByteBuffer packetData = this.ndpTable.getNeighborSolicitationPacket(sourceIP, destIP, localMac);
+            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV6_PACKET, 0, packetData, nextDeadline);
+            if (result != ResultCode.RESULT_OK) {
+                Log.e(TAG, "Error calling processVirtualNetworkFrame: " + result.toString());
+            } else {
+                Log.d(TAG, "Neighbor Solicitation sent to ZT");
+                this.ztService.setNextBackgroundTaskDeadline(nextDeadline[0]);
+            }
+        }
+
+    }
+
+    public void interrupt() {
+        if (this.receiveThread != null) {
+            try {
+                this.vpnInFileChannel.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error stopping in: " + e.getMessage(), e);
+            }
+            try {
+                this.vpnOutFileChannel.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error stopping out: " + e.getMessage(), e);
+            }
+            this.receiveThread.interrupt();
+            try {
+                this.receiveThread.join();
+            } catch (InterruptedException ignored) {
             }
         }
     }
 
+    public void join() throws InterruptedException {
+        this.receiveThread.join();
+    }
 
-    // 修复: 调整方法签名以匹配新的 VirtualNetworkFrameListener 接口 (ByteBuffer -> byte[])
+    private boolean isNeighborSolicitation(ByteBuffer byteBuffer) {
+        byteBuffer.mark();
+        int currPos = byteBuffer.position();
+        try {
+            byteBuffer.position(currPos + 6);
+            if (byteBuffer.get() != 58) return false;
+            byteBuffer.position(currPos + 40);
+            if (byteBuffer.get() != -121) return false;
+            return true;
+        } finally {
+            byteBuffer.reset();
+        }
+    }
+
+    private boolean isNeighborAdvertisement(ByteBuffer byteBuffer) {
+        byteBuffer.mark();
+        int currPos = byteBuffer.position();
+        try {
+            byteBuffer.position(currPos + 6);
+            if (byteBuffer.get() != 58) return false;
+            byteBuffer.position(currPos + 40);
+            if (byteBuffer.get() != -120) return false;
+            return true;
+        } finally {
+            byteBuffer.reset();
+        }
+    }
+
+    public boolean isRunning() {
+        var thread = this.receiveThread;
+        if (thread == null) {
+            return false;
+        }
+        return thread.isAlive();
+    }
+
+    /**
+     * 响应并处理 ZT 网络发送至本节点的以太网帧
+     */
     @Override
     public void onVirtualNetworkFrame(long networkId, long srcMac, long destMac, long etherType,
-                                      long vlanId, byte[] frameData) { 
-        // 将 byte[] 包装为 ByteBuffer 以兼容旧逻辑
-        ByteBuffer frameBuffer = ByteBuffer.wrap(frameData);
-        frameBuffer.order(ByteOrder.nativeOrder()); // 确保字节序正确
-
-        DebugLog.d(TAG, "onVirtualNetworkFrame: NetID: " + StringUtils.toHexString(networkId) +
-                " SrcMAC: " + StringUtils.toHexString(srcMac) +
-                " DestMAC: " + StringUtils.toHexString(destMac) +
-                " EtherType: " + etherType +
-                " VLAN ID: " + vlanId + " Frame Length: " + frameBuffer.remaining());
-
-        if (etherType == ARP_PACKET) {
-            // 修复: 传递 frameBuffer (ByteBuffer)
-            var arpReply = this.arpTable.processARPPacket(frameBuffer);
-            if (arpReply != null) {
-                try {
-                    // 修复: 将 ByteBuffer 转换为 byte[]
-                    var arpReplyData = new byte[arpReply.remaining()];
-                    arpReply.get(arpReplyData);
-
-                    long[] nextDeadline = new long[1];
-                    var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, destMac, srcMac, ARP_PACKET, 0,
-                            arpReplyData, nextDeadline); // 使用 byte[]
-                    if (result != ResultCode.RESULT_OK) {
-                        Log.e(TAG, "processVirtualNetworkFrame for ARP reply returned: " + result.toString());
-                        this.ztService.shutdown();
+                                      long vlanId, ByteBuffer frameData) {
+        DebugLog.d(TAG, "Got Virtual Network Frame. " +
+                " Network ID: " + StringUtils.networkIdToString(networkId) +
+                " Source MAC: " + StringUtils.macAddressToString(srcMac) +
+                " Dest MAC: " + StringUtils.macAddressToString(destMac) +
+                " Ether type: " + StringUtils.etherTypeToString(etherType) +
+                " VLAN ID: " + vlanId + " Frame Length: " + frameData.remaining());
+        if (this.vpnSocket == null) {
+            Log.e(TAG, "vpnSocket is null!");
+        } else if (this.vpnInFileChannel == null || this.vpnOutFileChannel == null) {
+            Log.e(TAG, "no vpnFileChannel");
+        } else if (etherType == ARP_PACKET) {
+            // 收到 ARP 包。更新 ARP 表，若需要则进行应答
+            Log.d(TAG, "Got ARP Packet");
+            var arpReply = this.arpTable.processARPPacket(frameData);
+            if (arpReply != null && arpReply.getDestMac() != 0 && arpReply.getDestAddress() != null) {
+                // 获取本地 V4 地址
+                var networkConfig = this.node.networkConfig(networkId);
+                InetAddress localV4Address = null;
+                for (var address : networkConfig.getAssignedAddresses()) {
+                    if (address.getAddress() instanceof Inet4Address) {
+                        localV4Address = address.getAddress();
+                        break;
                     }
+                }
+                // 构造并返回 ARP 应答
+                if (localV4Address != null) {
+                    var nextDeadline = new long[1];
+                    ByteBuffer packetData = this.arpTable.getReplyPacket(networkConfig.getMac(),
+                            localV4Address, arpReply.getDestMac(), arpReply.getDestAddress());
+                    var result = this.node
+                            .processVirtualNetworkFrame(System.currentTimeMillis(), networkId,
+                                    networkConfig.getMac(), srcMac, ARP_PACKET, 0,
+                                    packetData, nextDeadline);
+                    if (result != ResultCode.RESULT_OK) {
+                        Log.e(TAG, "Error sending ARP packet: " + result.toString());
+                        return;
+                    }
+                    Log.d(TAG, "ARP Reply Sent!");
                     this.ztService.setNextBackgroundTaskDeadline(nextDeadline[0]);
-                } catch (Exception e) {
-                    Log.e(TAG, "Error processing ARP reply: " + e.getMessage(), e);
                 }
             }
         } else if (etherType == IPV4_PACKET) {
-            DebugLog.d(TAG, "Got IPv4 packet. Length: " + frameBuffer.remaining() + " Bytes");
+            // 收到 IPv4 包。根据需要发送至 TUN
+            DebugLog.d(TAG, "Got IPv4 packet. Length: " + frameData.remaining() + " Bytes");
             try {
-                // 修复: 传递 frameBuffer (ByteBuffer)
-                frameBuffer.rewind();
-                var sourceIP = IPPacketUtils.getSourceIP(frameBuffer);
-                frameBuffer.rewind();
-                var destIP = IPPacketUtils.getDestIP(frameBuffer);
+                var sourceIP = IPPacketUtils.getSourceIP(frameData);
+                if (sourceIP != null) {
+                    if (isIPv4Multicast(sourceIP)) {
+                        var result = this.node.multicastSubscribe(this.networkId, multicastAddressToMAC(sourceIP));
+                        if (result != ResultCode.RESULT_OK) {
+                            Log.e(TAG, "Error when calling multicastSubscribe: " + result);
+                        }
+                    } else {
+                        this.arpTable.setAddress(sourceIP, srcMac);
+                    }
+                }
 
-                if (this.ztService.getLocalMac() == destMac) {
-                    // Destination is local (or broadcast), write to TUN
-                    frameBuffer.rewind();
-                    // 修复: 传递 frameBuffer (ByteBuffer)
-                    int written = this.vpnOutFileChannel.write(frameBuffer);
-                    if (written == -1) {
-                        Log.e(TAG, "Error writing data to vpn socket: " + written);
-                    } else if (frameBuffer.remaining() > 0) {
-                        Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameBuffer.remaining());
-                    }
-                } else if (destMac == -1) {
-                    // IPv4 broadcast?
-                    frameBuffer.rewind();
-                    // 修复: 传递 frameBuffer (ByteBuffer)
-                    int written = this.vpnOutFileChannel.write(frameBuffer);
-                    if (written == -1) {
-                        Log.e(TAG, "Error writing data to vpn socket: " + written);
-                    } else if (frameBuffer.remaining() > 0) {
-                        Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameBuffer.remaining());
-                    }
-                } else {
-                    Log.d(TAG, "onVirtualNetworkFrame: Packet not for me. DestMAC: " + StringUtils.toHexString(destMac));
+                int written = this.vpnOutFileChannel.write(frameData);
+                if (written == -1) {
+                    Log.e(TAG, "Error writing data to vpn socket: " + written);
+                } else if (frameData.remaining() > 0) {
+                    Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameData.remaining());
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Error writing data to vpn socket: " + e.getMessage(), e);
             }
         } else if (etherType == IPV6_PACKET) {
-            DebugLog.d(TAG, "Got IPv6 packet. Length: " + frameBuffer.remaining() + " Bytes");
+            // 收到 IPv6 包。根据需要发送至 TUN，并更新 NDP 表
+            DebugLog.d(TAG, "Got IPv6 packet. Length: " + frameData.remaining() + " Bytes");
             try {
-                // 修复: 传递 frameBuffer (ByteBuffer)
-                frameBuffer.rewind();
-                var sourceIP = IPPacketUtils.getSourceIP(frameBuffer);
-                frameBuffer.rewind();
-                var destIP = IPPacketUtils.getDestIP(frameBuffer);
-
-                if (this.ztService.getLocalMac() == destMac) {
-                    // Destination is local (or broadcast), write to TUN
-                    frameBuffer.rewind();
-                    // 修复: 传递 frameBuffer (ByteBuffer)
-                    int written = this.vpnOutFileChannel.write(frameBuffer);
-                    if (written == -1) {
-                        Log.e(TAG, "Error writing data to vpn socket: " + written);
-                    } else if (frameBuffer.remaining() > 0) {
-                        Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameBuffer.remaining());
+                var sourceIP = IPPacketUtils.getSourceIP(frameData);
+                if (sourceIP != null) {
+                    if (isIPv6Multicast(sourceIP)) {
+                        var result = this.node.multicastSubscribe(this.networkId, multicastAddressToMAC(sourceIP));
+                        if (result != ResultCode.RESULT_OK) {
+                            Log.e(TAG, "Error when calling multicastSubscribe: " + result);
+                        }
+                    } else {
+                        this.ndpTable.setAddress(sourceIP, srcMac);
                     }
-                } else if (destMac == -1) {
-                    // IPv6 multicast or broadcast?
-                    frameBuffer.rewind();
-                    // 修复: 传递 frameBuffer (ByteBuffer)
-                    int written = this.vpnOutFileChannel.write(frameBuffer);
-                    if (written == -1) {
-                        Log.e(TAG, "Error writing data to vpn socket: " + written);
-                    } else if (frameBuffer.remaining() > 0) {
-                        Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameBuffer.remaining());
-                    }
-                } else {
-                    Log.d(TAG, "onVirtualNetworkFrame: Packet not for me. DestMAC: " + StringUtils.toHexString(destMac));
+                }
+                int written = this.vpnOutFileChannel.write(frameData);
+                if (written == -1) {
+                    Log.e(TAG, "Error writing data to vpn socket: " + written);
+                } else if (frameData.remaining() > 0) {
+                    Log.e(TAG, "Error writing data to vpn socket: written: " + written + " remaining " + frameData.remaining());
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Error writing data to vpn socket: " + e.getMessage(), e);
             }
-        } else if (frameBuffer.remaining() >= 14) {
-            // 修复: 从 ByteBuffer 读取
-            Log.d(TAG, "Unknown Packet Type Received: 0x" + String.format("%02X%02X", frameBuffer.get(12), frameBuffer.get(13)));
+        } else if (frameData.remaining() >= 14) {
+            Log.d(TAG, "Unknown Packet Type Received: 0x" + String.format("%02X%02X", frameData.get(12), frameData.get(13)));
         } else {
-            // 修复: 从 ByteBuffer 读取
-            Log.d(TAG, "Unknown Packet Received.  Packet Length: " + frameBuffer.remaining());
+            Log.d(TAG, "Unknown Packet Received.  Packet Length: " + frameData.remaining());
         }
     }
 
@@ -366,10 +534,10 @@ public class TunTapAdapter implements VirtualNetworkFrameListener {
         synchronized (this.routeMap) {
             for (Route route : this.routeMap.keySet()) {
                 if (route.belongsToRoute(destAddress)) {
-                    return Objects.requireNonNull(this.routeMap.get(route));
+                    return this.routeMap.get(route).longValue();
                 }
             }
-            return 0L;
+            return 0;
         }
     }
 }
