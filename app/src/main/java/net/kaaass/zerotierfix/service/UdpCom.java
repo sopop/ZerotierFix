@@ -32,7 +32,7 @@ public class UdpCom implements PacketSender, Runnable {
     }
 
     @Override // com.zerotier.sdk.PacketSender
-    public int onSendPacketRequested(long j, InetSocketAddress inetSocketAddress, ByteBuffer bArr, int i) {
+    public int onSendPacketRequested(long j, InetSocketAddress inetSocketAddress, byte bArr, int i) {
         if (this.svrChannel == null) {
             Log.e(TAG, "Attempted to send packet on a null socket");
             return -1;
@@ -58,7 +58,10 @@ public class UdpCom implements PacketSender, Runnable {
                     buf.flip();
                     if (buf.remaining() > 0) {
                         DebugLog.d(TAG, "Got " + buf.remaining() + " Bytes From: " + recvSockAddr);
-                        ResultCode processWirePacket = this.node.processWirePacket(System.currentTimeMillis(), -1, (InetSocketAddress) recvSockAddr, buf, jArr);
+                        // **新增：将 ByteBuffer 转换为 byte[]**
+                        var dataArray = new byte[buf.remaining()];
+                        buf.get(dataArray);
+                        ResultCode processWirePacket = this.node.processWirePacket(System.currentTimeMillis(), -1, (InetSocketAddress) recvSockAddr, dataArray, jArr);
                         if (processWirePacket != ResultCode.RESULT_OK) {
                             Log.e(TAG, "processWirePacket returned: " + processWirePacket.toString());
                             this.ztService.shutdown();

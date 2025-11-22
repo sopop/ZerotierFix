@@ -224,7 +224,10 @@ public class TunTapAdapter implements VirtualNetworkFrameListener {
             } else {
                 destMac = this.arpTable.getMacForAddress(destIP);
             }
-            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV4_PACKET, 0, byteBuffer, nextDeadline);
+            // **新增：将 ByteBuffer 转换为 byte[]**
+            var dataArray = new byte[byteBuffer.remaining()];
+            byteBuffer.get(dataArray);
+            var result = this.node.processVirtualNetworkFrame(System.currentTimeMillis(), this.networkId, localMac, destMac, IPV4_PACKET, 0, dataArray, nextDeadline);
             if (result != ResultCode.RESULT_OK) {
                 Log.e(TAG, "Error calling processVirtualNetworkFrame: " + result.toString());
                 return;
@@ -421,7 +424,7 @@ public class TunTapAdapter implements VirtualNetworkFrameListener {
      */
     @Override
     public void onVirtualNetworkFrame(long networkId, long srcMac, long destMac, long etherType,
-                                      long vlanId, ByteBuffer frameData) {
+                                      long vlanId, byte frameData) {
         DebugLog.d(TAG, "Got Virtual Network Frame. " +
                 " Network ID: " + StringUtils.networkIdToString(networkId) +
                 " Source MAC: " + StringUtils.macAddressToString(srcMac) +
